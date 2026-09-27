@@ -4,6 +4,10 @@ Use spec: https://common-changelog.org/
 
 ## Staged
 
+### Fixed
+
+- Preserve accepted input with backpressure when the PTY reader stalls. Keep control requests responsive and retain queued bytes after sender EOF.
+
 ## v0.8.1 - 2026-09-05
 
 ### Fixed

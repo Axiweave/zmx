@@ -68,12 +68,21 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
     defer _ = lib_posix.fcntl(stdin_fd, lib_posix.F.SETFL, stdin_orig_flags) catch {};
 
     const detach_key_disabled = util.isDetachKeyDisabled();
+    var stdin_eof = false;
+    var resize_pending = false;
 
     while (true) {
+        if (resize_pending and !stdin_eof and sock_write_buf.items.len < Daemon.PTY_WRITE_BUF_MAX) {
+            const next_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
+            try ipc.appendSizeMessage(gpa, &sock_write_buf, .Resize, next_size);
+            resize_pending = false;
+        }
+
         poll_fds.clearRetainingCapacity();
 
         try poll_fds.append(gpa, .{
-            .fd = stdin_fd,
+            // A negative fd also suppresses HUP while socket pressure pauses stdin.
+            .fd = if (!stdin_eof and sock_write_buf.items.len < Daemon.PTY_WRITE_BUF_MAX) stdin_fd else -1,
             .events = lib_posix.POLL.IN,
             .revents = 0,
         });
@@ -103,8 +112,7 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
-            const next_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
-            try ipc.appendSizeMessage(gpa, &sock_write_buf, .Resize, next_size);
+            resize_pending = true;
         }
 
         // Handle stdin -> socket (Input)
@@ -127,8 +135,7 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
                     }
                 } else {
                     std.log.info("eof stdin", .{});
-                    // EOF on stdin
-                    return ClientResult{ .kind = .detach, .session_name = null };
+                    stdin_eof = true;
                 }
             }
         }
@@ -159,8 +166,7 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
                     .Resize => {
                         // daemon is asking for the client's window size usually in response
                         // to this client being set as leader.
-                        const next_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
-                        try ipc.appendSizeMessage(gpa, &sock_write_buf, .Resize, next_size);
+                        resize_pending = true;
                     },
                     .Switch => {
                         std.log.info("switch session", .{});
@@ -205,6 +211,9 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
             if (n > 0) {
                 try stdout_buf.replaceRange(gpa, 0, n, &[_]u8{});
             }
+        }
+        if (stdin_eof and sock_write_buf.items.len == 0) {
+            return ClientResult{ .kind = .detach, .session_name = null };
         }
 
         if (poll_fds.items[1].revents & (lib_posix.POLL.HUP | lib_posix.POLL.ERR | lib_posix.POLL.NVAL) != 0) {
@@ -252,10 +261,14 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
         // when the last attached client leaves and focus-in when one returns,
         // as a terminal would when its window loses/gains focus.
         const has_terminal_client = daemon.hasTerminalClient();
-        if (has_terminal_client != had_terminal_client and term.modes.get(.focus_event)) {
-            daemon.queuePtyInput(gpa, if (has_terminal_client) "\x1b[I" else "\x1b[O");
+        if (has_terminal_client != had_terminal_client) {
+            if (!term.modes.get(.focus_event)) {
+                had_terminal_client = has_terminal_client;
+            } else if (daemon.pty_write_buf.items.len < Daemon.PTY_WRITE_BUF_MAX) {
+                try daemon.queuePtyInput(gpa, if (has_terminal_client) "\x1b[I" else "\x1b[O");
+                had_terminal_client = has_terminal_client;
+            }
         }
-        had_terminal_client = has_terminal_client;
 
         poll_fds.clearRetainingCapacity();
 
@@ -277,19 +290,23 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
 
         try poll_fds.append(gpa, .{ .fd = signal.sig_pipe[0], .events = lib_posix.POLL.IN, .revents = 0 });
 
+        var has_buffered_messages = false;
         for (daemon.clients.items) |client| {
-            var events: i16 = lib_posix.POLL.IN;
-            if (client.has_pending_output) {
+            const blocked = daemon.ptyInputBlocked(client);
+            if (!blocked and client.read_buf.peek() != null) has_buffered_messages = true;
+            var events: i16 = if (!client.read_eof and !blocked) lib_posix.POLL.IN else 0;
+            if (client.has_pending_output and !client.write_closed) {
                 events |= lib_posix.POLL.OUT;
             }
             try poll_fds.append(gpa, .{
-                .fd = client.socket_fd,
+                // events=0 still reports HUP. Omit inactive descriptors instead.
+                .fd = if (events != 0) client.socket_fd else -1,
                 .events = events,
                 .revents = 0,
             });
         }
 
-        _ = try lib_posix.poll(poll_fds.items, -1);
+        _ = try lib_posix.poll(poll_fds.items, if (has_buffered_messages) 0 else -1);
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
@@ -363,7 +380,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     if (!daemon.hasTerminalClient() and
                         daemon.pty_write_buf.items.len < Daemon.PTY_WRITE_BUF_MAX)
                     {
-                        util.respondToDeviceAttributes(gpa, &daemon.pty_write_buf, buf[0..n]);
+                        try util.respondToDeviceAttributes(gpa, &daemon.pty_write_buf, buf[0..n]);
                     }
 
                     // In run mode, scan output for exit code marker. The marker
@@ -384,6 +401,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
 
                             // Notify connected clients
                             for (daemon.clients.items) |c| {
+                                if (c.write_closed) continue;
                                 ipc.appendMessage(gpa, &c.write_buf, .TaskComplete, &[_]u8{exit_code}) catch {};
                                 c.has_pending_output = true;
                             }
@@ -402,6 +420,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     const broadcast_data = util.rewritePromptRedraw(gpa, buf[0..n]) orelse buf[0..n];
                     defer if (broadcast_data.ptr != buf[0..n].ptr) gpa.free(broadcast_data);
                     for (daemon.clients.items) |client| {
+                        if (client.write_closed) continue;
                         ipc.appendMessage(gpa, &client.write_buf, .Output, broadcast_data) catch |err| {
                             std.log.warn(
                                 "failed to buffer output for client err={s}",
@@ -418,11 +437,8 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
         if (poll_fds.items[1].revents & lib_posix.POLL.OUT != 0) {
             while (daemon.pty_write_buf.items.len > 0) {
                 const n = lib_posix.write(pty_fd, daemon.pty_write_buf.items) catch |err| {
-                    if (err != error.WouldBlock) {
-                        std.log.warn("pty write failed: {s}", .{@errorName(err)});
-                        daemon.pty_write_buf.clearRetainingCapacity();
-                    }
-                    break;
+                    if (err == error.WouldBlock) break;
+                    return err;
                 };
                 if (n == 0) break;
                 daemon.pty_write_buf.replaceRange(gpa, 0, n, &[_]u8{}) catch unreachable;
@@ -445,82 +461,84 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             const client = daemon.clients.items[i];
             const revents = poll_fds.items[i + 3].revents;
 
-            if (revents & lib_posix.POLL.IN != 0) {
-                const n = client.read_buf.read(client.socket_fd) catch |err| {
-                    if (err == error.WouldBlock) continue;
+            const close_flags = lib_posix.POLL.HUP | lib_posix.POLL.ERR | lib_posix.POLL.NVAL;
+            if (!client.read_eof and !daemon.ptyInputBlocked(client) and
+                revents & (lib_posix.POLL.IN | close_flags) != 0)
+            {
+                const n_opt: ?usize = client.read_buf.read(client.socket_fd) catch |err| blk: {
+                    if (err == error.WouldBlock) {
+                        break :blk if (revents & close_flags != 0) 0 else null;
+                    }
+                    if (err == error.OutOfMemory) return err;
                     std.log.debug(
                         "client read err={s} fd={d}",
                         .{ @errorName(err), client.socket_fd },
                     );
-                    const last = daemon.closeClient(gpa, client, i, false);
-                    if (last) break :daemon_loop;
-                    continue;
+                    client.write_closed = true;
+                    break :blk 0;
                 };
-
-                if (n == 0) {
-                    // Client closed connection
-                    const last = daemon.closeClient(gpa, client, i, false);
-                    if (last) break :daemon_loop;
-                    continue;
-                }
-
-                while (client.read_buf.next()) |msg| {
-                    switch (msg.header.tag) {
-                        .Input => try daemon.handleInput(gpa, client, msg.payload),
-                        .Send => daemon.handleSend(gpa, msg.payload),
-                        .Output => try daemon.handleOutput(gpa, msg.payload, &term, &vt_stream),
-                        .Init => try daemon.handleInit(gpa, client, pty_fd, &term, msg.payload),
-                        .Switch => try daemon.handleSwitch(gpa, msg.payload),
-                        .Resize => try daemon.handleResize(gpa, client, pty_fd, &term, msg.payload),
-                        .Detach => {
-                            daemon.handleDetach(gpa, client, i);
-                            break :clients_loop;
-                        },
-                        .DetachAll => {
-                            daemon.handleDetachAll(gpa);
-                            break :clients_loop;
-                        },
-                        .Kill => {
-                            break :daemon_loop;
-                        },
-                        .Info => try daemon.handleInfo(gpa, client, &term),
-                        .LabelGet => try daemon.handleLabelGet(gpa, client),
-                        .LabelSet => try daemon.handleLabelSet(gpa, client, msg.payload),
-                        .LabelClear => try daemon.handleLabelClear(gpa, client),
-                        .EnvGet => try daemon.handleEnvGet(gpa, client),
-                        .EnvSet => try daemon.handleEnvSet(gpa, client, msg.payload),
-                        .History => try daemon.handleHistory(gpa, client, &term, msg.payload),
-                        .Run => try daemon.handleRun(gpa, io, client, msg.payload),
-                        .Ack, .TaskComplete, .LabelData, .EnvData => {},
-                        .Write => try daemon.handleWrite(gpa, client, msg.payload),
-                        _ => std.log.warn(
-                            "ignoring unknown IPC tag={d}",
-                            .{@intFromEnum(msg.header.tag)},
-                        ),
-                    }
+                if (n_opt) |n| {
+                    if (n == 0) client.read_eof = true;
                 }
             }
 
-            if (revents & lib_posix.POLL.OUT != 0) {
-                // Flush pending output buffers
-                const n = lib_posix.write(client.socket_fd, client.write_buf.items) catch |err| blk: {
-                    if (err == error.WouldBlock) break :blk 0;
-                    // Error on write, close client
-                    const last = daemon.closeClient(gpa, client, i, false);
-                    if (last) break :daemon_loop;
-                    continue;
-                };
+            // Keep complete messages in the receive buffer until the PTY admits them.
+            // Process buffered messages even without a new socket event or after EOF.
+            while (client.read_buf.peek()) |msg| {
+                if (daemon.ptyInputBlocked(client)) break;
+                switch (msg.header.tag) {
+                    .Input => try daemon.handleInput(gpa, client, msg.payload),
+                    .Send => try daemon.handleSend(gpa, msg.payload),
+                    .Output => try daemon.handleOutput(gpa, msg.payload, &term, &vt_stream),
+                    .Init => try daemon.handleInit(gpa, client, pty_fd, &term, msg.payload),
+                    .Switch => try daemon.handleSwitch(gpa, msg.payload),
+                    .Resize => try daemon.handleResize(gpa, client, pty_fd, &term, msg.payload),
+                    .Detach => {
+                        daemon.handleDetach(gpa, client, i);
+                        break :clients_loop;
+                    },
+                    .DetachAll => {
+                        daemon.handleDetachAll(gpa);
+                        break :clients_loop;
+                    },
+                    .Kill => {
+                        break :daemon_loop;
+                    },
+                    .Info => try daemon.handleInfo(gpa, client, &term),
+                    .LabelGet => try daemon.handleLabelGet(gpa, client),
+                    .LabelSet => try daemon.handleLabelSet(gpa, client, msg.payload),
+                    .LabelClear => try daemon.handleLabelClear(gpa, client),
+                    .EnvGet => try daemon.handleEnvGet(gpa, client),
+                    .EnvSet => try daemon.handleEnvSet(gpa, client, msg.payload),
+                    .History => try daemon.handleHistory(gpa, client, &term, msg.payload),
+                    .Run => try daemon.handleRun(gpa, io, client, msg.payload),
+                    .Ack, .TaskComplete, .LabelData, .EnvData => {},
+                    .Write => try daemon.handleWrite(gpa, client, msg.payload),
+                    _ => std.log.warn(
+                        "ignoring unknown IPC tag={d}",
+                        .{@intFromEnum(msg.header.tag)},
+                    ),
+                }
+                _ = client.read_buf.next();
+            }
 
+            if (!client.write_closed and client.has_pending_output and
+                revents & (lib_posix.POLL.OUT | close_flags) != 0)
+            {
+                const n: usize = lib_posix.write(client.socket_fd, client.write_buf.items) catch |err| blk: {
+                    if (err == error.WouldBlock and revents & close_flags == 0) break :blk 0;
+                    // A dead output side must not discard accepted input.
+                    client.write_closed = true;
+                    break :blk 0;
+                };
                 if (n > 0) {
                     client.write_buf.replaceRange(gpa, 0, n, &[_]u8{}) catch unreachable;
                 }
-
-                if (client.write_buf.items.len == 0) {
-                    client.has_pending_output = false;
-                }
             }
 
-            if (revents & (lib_posix.POLL.HUP | lib_posix.POLL.ERR | lib_posix.POLL.NVAL) != 0) {
+            if (client.write_closed) client.write_buf.clearRetainingCapacity();
+            client.has_pending_output = client.write_buf.items.len > 0;
+            if (client.read_eof and client.read_buf.peek() == null and !client.has_pending_output) {
                 const last = daemon.closeClient(gpa, client, i, false);
                 if (last) break :daemon_loop;
             }
@@ -544,6 +562,8 @@ pub const Client = struct {
     alloc: std.mem.Allocator,
     socket_fd: i32,
     has_pending_output: bool = false,
+    read_eof: bool = false,
+    write_closed: bool = false,
     is_terminal: bool = false, // sent .Init (a `zmx attach`), not a run/send/tail client
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
@@ -863,32 +883,26 @@ pub const Daemon = struct {
         return null;
     }
 
+    // This is an admission watermark, not a message-size limit.
+    // The queue can exceed it by one complete message, including Run/Write
+    // expansion, or one batch of generated device-query replies.
+    // ponytail: stream large control-message expansions if their peak memory
+    // becomes a problem. The existing IPC format buffers each complete message.
     const PTY_WRITE_BUF_MAX = 256 * 1024;
 
-    /// Queue bytes for the PTY's stdin. Flushed by daemonLoop on POLLOUT.
-    /// Drops the payload if the buffer is over cap -- same failure mode as
-    /// the old direct-write ptyWrite (drop on EAGAIN), just at a 64x higher
-    /// threshold. Capping avoids OOM when the shell stops reading; dropping
-    /// new (not old) bytes avoids tearing a partially-accepted sequence.
-    fn queuePtyInput(self: *Daemon, gpa: std.mem.Allocator, data: []const u8) void {
-        if (data.len == 0) return;
-        if (self.pty_write_buf.items.len + data.len > PTY_WRITE_BUF_MAX) {
-            std.log.warn(
-                "pty input dropped {d} bytes (buffer full, shell not reading)",
-                .{data.len},
-            );
-            return;
-        }
-
-        // NOTE: for local dev only
-        // std.log.debug("buffering pty input data={x}", .{data});
-
-        self.pty_write_buf.appendSlice(gpa, data) catch |err| {
-            std.log.warn(
-                "pty input dropped {d} bytes: {s}",
-                .{ data.len, @errorName(err) },
-            );
+    fn ptyInputBlocked(self: *const Daemon, client: *const Client) bool {
+        if (self.pty_write_buf.items.len < PTY_WRITE_BUF_MAX) return false;
+        const msg = client.read_buf.peek() orelse return false;
+        return switch (msg.header.tag) {
+            .Input, .Send, .Run => msg.payload.len > 0,
+            .Write => true,
+            else => false,
         };
+    }
+
+    /// Append admitted bytes in FIFO order. daemonLoop applies socket pressure.
+    fn queuePtyInput(self: *Daemon, gpa: std.mem.Allocator, data: []const u8) !void {
+        try self.pty_write_buf.appendSlice(gpa, data);
     }
 
     pub fn handleInput(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
@@ -897,20 +911,20 @@ pub const Daemon = struct {
 
         // client is leader, send entire payload (ansi escape codes + text)
         if (self.leader_client_fd == client.socket_fd) {
-            self.queuePtyInput(gpa, payload);
+            try self.queuePtyInput(gpa, payload);
             return;
         }
 
         // check if leader needs to be updated by detecting any user input
         if (util.isUserInput(payload)) {
             try self.setLeader(gpa, client);
-            self.queuePtyInput(gpa, payload);
+            try self.queuePtyInput(gpa, payload);
         }
     }
 
     /// Queue input from `zmx send` without changing interactive client leadership.
-    pub fn handleSend(self: *Daemon, gpa: std.mem.Allocator, payload: []const u8) void {
-        self.queuePtyInput(gpa, payload);
+    pub fn handleSend(self: *Daemon, gpa: std.mem.Allocator, payload: []const u8) !void {
+        try self.queuePtyInput(gpa, payload);
     }
 
     pub fn handleSwitch(self: *Daemon, gpa: std.mem.Allocator, session_name: []const u8) !void {
@@ -1173,12 +1187,15 @@ pub const Daemon = struct {
         const heredoc_marker = try std.fmt.bufPrint(&here_buf, "\r\necho {s}$?\r", .{marker});
         const uses_heredoc = std.mem.indexOf(u8, cmd, "<<") != null;
 
+        const queued_len = self.pty_write_buf.items.len;
+        errdefer self.pty_write_buf.items.len = queued_len;
+
         if (cmd.len > 0 and cmd[cmd.len - 1] == '\r') {
-            self.queuePtyInput(gpa, cmd[0 .. cmd.len - 1]);
+            try self.queuePtyInput(gpa, cmd[0 .. cmd.len - 1]);
         } else {
-            self.queuePtyInput(gpa, cmd);
+            try self.queuePtyInput(gpa, cmd);
         }
-        self.queuePtyInput(gpa, if (uses_heredoc) heredoc_marker else single_line_marker);
+        try self.queuePtyInput(gpa, if (uses_heredoc) heredoc_marker else single_line_marker);
 
         try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
         client.has_pending_output = true;
@@ -1236,6 +1253,7 @@ pub const Daemon = struct {
         self.setPwd(term);
         self.has_pty_output = true;
         for (self.clients.items) |client| {
+            if (client.write_closed) continue;
             try ipc.appendMessage(gpa, &client.write_buf, .Output, payload);
             client.has_pending_output = true;
         }
@@ -1263,6 +1281,9 @@ pub const Daemon = struct {
         var offset: usize = 0;
         var is_first = true;
 
+        const queued_len = self.pty_write_buf.items.len;
+        errdefer self.pty_write_buf.items.len = queued_len;
+
         while (offset < file_content.len or is_first) {
             const end = @min(offset + chunk_size, file_content.len);
             const chunk = file_content[offset..end];
@@ -1272,16 +1293,16 @@ pub const Daemon = struct {
             defer gpa.free(encoded);
             _ = std.base64.standard.Encoder.encode(encoded, chunk);
 
-            self.queuePtyInput(gpa, "printf '%s' '");
-            self.queuePtyInput(gpa, encoded);
+            try self.queuePtyInput(gpa, "printf '%s' '");
+            try self.queuePtyInput(gpa, encoded);
             if (is_first) {
-                self.queuePtyInput(gpa, "' | base64 -d > '");
+                try self.queuePtyInput(gpa, "' | base64 -d > '");
             } else {
-                self.queuePtyInput(gpa, "' | base64 -d >> '");
+                try self.queuePtyInput(gpa, "' | base64 -d >> '");
             }
-            self.queuePtyInput(gpa, file_path);
-            self.queuePtyInput(gpa, "'");
-            self.queuePtyInput(gpa, "\r");
+            try self.queuePtyInput(gpa, file_path);
+            try self.queuePtyInput(gpa, "'");
+            try self.queuePtyInput(gpa, "\r");
 
             offset = end;
             is_first = false;
@@ -1444,7 +1465,7 @@ test "send queues PTY input without changing leader" {
     daemon.leader_client_fd = 42;
     defer daemon.pty_write_buf.deinit(alloc);
 
-    daemon.handleSend(alloc, "hello");
+    try daemon.handleSend(alloc, "hello");
 
     try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
     try std.testing.expectEqualStrings("hello", daemon.pty_write_buf.items);

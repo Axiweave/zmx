@@ -207,18 +207,15 @@ pub const SocketBuffer = struct {
             self.head = 0;
         }
 
-        var tmp: [4096]u8 = undefined;
-        const n = try lib_posix.read(fd, &tmp);
-        if (n > 0) {
-            try self.buf.appendSlice(self.alloc, tmp[0..n]);
-        }
+        try self.buf.ensureUnusedCapacity(self.alloc, 4096);
+        const n = try lib_posix.read(fd, self.buf.unusedCapacitySlice()[0..4096]);
+        self.buf.items.len += n;
         return n;
     }
 
-    /// Returns the next complete message or `null` when none available.
-    /// `buf` is advanced automatically; caller keeps the returned slices
-    /// valid until the following `next()` (or `deinit`).
-    pub fn next(self: *SocketBuffer) ?SocketMsg {
+    /// Returns the next complete message without consuming it.
+    /// A read() or deinit() call invalidates the returned slices.
+    pub fn peek(self: *const SocketBuffer) ?SocketMsg {
         const available = self.buf.items[self.head..];
         const total = expectedLength(available) orelse return null;
         if (available.len < total) return null;
@@ -226,8 +223,14 @@ pub const SocketBuffer = struct {
         const hdr = std.mem.bytesToValue(Header, available[0..@sizeOf(Header)]);
         const pay = available[@sizeOf(Header)..total];
 
-        self.head += total;
         return .{ .header = hdr, .payload = pay };
+    }
+
+    /// Consumes the next complete message, if one is available.
+    pub fn next(self: *SocketBuffer) ?SocketMsg {
+        const msg = self.peek() orelse return null;
+        self.head += @sizeOf(Header) + msg.payload.len;
+        return msg;
     }
 };
 
